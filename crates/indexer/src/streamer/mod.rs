@@ -121,6 +121,34 @@ impl Streamer {
             primary = %config.stellar_rpc_url,
             "RPC endpoint pool configured with health scoring"
         );
+
+        // Verify at least one configured endpoint is actually reachable
+        // before the poll loop starts (issue #687). Config validation only
+        // bounds-checks the shape of the URL list; a misconfigured or
+        // unreachable endpoint (wrong URL, blocked egress, an expired API
+        // key) would otherwise only surface once polling begins failing.
+        if config.rpc_startup_check_enabled {
+            match rpc.check_connectivity().await {
+                Ok(tip) => {
+                    tracing::info!(chain_tip = tip, "RPC connectivity check passed");
+                }
+                Err(e) => {
+                    return Err(TridentError::config(anyhow::anyhow!(
+                        "[trident-indexer] startup RPC connectivity check failed against all \
+                         {} configured endpoint(s) ({:?}): {e}. Set \
+                         RPC_STARTUP_CHECK_ENABLED=false to skip this check (not recommended).",
+                        config.stellar_rpc_urls.len(),
+                        config.stellar_rpc_urls,
+                    )));
+                }
+            }
+        } else {
+            tracing::warn!(
+                "RPC_STARTUP_CHECK_ENABLED=false: an unreachable RPC endpoint will not be \
+                 detected until the poll loop starts failing"
+            );
+        }
+
         let sac_registry = crate::parser::sac::SacRegistry::build(
             &config.tracked_sac_assets,
             &config.network_passphrase,
@@ -1994,6 +2022,7 @@ mod tests {
             rpc_pool_max_idle_per_host: 8,
             rpc_tcp_keepalive: Duration::from_secs(60),
             rpc_max_calls_per_sec: 50,
+            rpc_startup_check_enabled: false,
             index_diagnostic: false,
             topic_filters: Vec::new(),
             max_events_per_poll: 200,
@@ -3620,5 +3649,81 @@ mod tests {
         );
 
         pool.close().await;
+    }
+
+    /// Streamer::new must fail fast when the startup connectivity check is
+    /// enabled and no configured endpoint is reachable, rather than
+    /// constructing successfully and only failing once the poll loop starts
+    /// (issue #687). make_streamer_with_pool hardcodes
+    /// rpc_startup_check_enabled: false for every other test here, so this
+    /// builds its own Config with the check turned on to exercise the real
+    /// wiring in Streamer::new rather than only the config/RPC layers in
+    /// isolation (covered separately in config::tests and rpc::tests).
+    #[tokio::test]
+    async fn new_fails_fast_when_startup_rpc_check_is_enabled_and_unreachable() {
+        let (db_url, redis_url) = require_services!();
+        let db = sqlx::PgPool::connect(&db_url).await.unwrap();
+
+        // Deliberately not pointed at a mock server: an address nothing is
+        // listening on, so the connect itself fails fast rather than relying
+        // on a 5xx response the mock would have to be configured to send.
+        let unreachable_rpc_url = "http://127.0.0.1:1".to_string();
+
+        let config = Config {
+            stellar_rpc_url: unreachable_rpc_url.clone(),
+            database_url: db_url.clone(),
+            db_pool_size: 3,
+            redis_url: redis_url.clone(),
+            network: "testnet".to_string(),
+            max_reorg_depth: 128,
+            poll_interval: Duration::from_millis(50),
+            poll_interval_floor: Duration::from_millis(50),
+            poll_interval_ceiling: Duration::from_millis(500),
+            lag_high_watermark: 100,
+            poll_hysteresis_ledgers: 10,
+            max_reorg_rewind_depth: 50,
+            gap_scan_max_per_run: 100,
+            stellar_rpc_urls: vec![unreachable_rpc_url],
+            rpc_failover_threshold: 3,
+            rpc_endpoint_cooldown: Duration::from_secs(30),
+            rpc_breaker_failure_threshold: 5,
+            rpc_breaker_cooldown: Duration::from_secs(30),
+            rpc_connect_timeout: Duration::from_millis(200),
+            rpc_request_timeout: Duration::from_millis(500),
+            rpc_pool_idle_timeout: Duration::from_secs(90),
+            rpc_pool_max_idle_per_host: 8,
+            rpc_tcp_keepalive: Duration::from_secs(60),
+            rpc_max_calls_per_sec: 50,
+            rpc_startup_check_enabled: true,
+            index_diagnostic: false,
+            topic_filters: Vec::new(),
+            max_events_per_poll: 200,
+            db_batch_size: 1_000,
+            redis_stream_maxlen: 10_000,
+            outbox_poll_interval: Duration::from_millis(10),
+            outbox_batch_size: 500,
+            outbox_backlog_alert_threshold: 10_000,
+            reconcile_enabled: false,
+            reconcile_interval: Duration::from_secs(600),
+            reconcile_ledger_span: 400,
+            reconcile_tip_margin: 100,
+            metrics_port: 0,
+            alert_webhook_url: None,
+            alert_lag_threshold: 200,
+            alert_cooldown_minutes: 30,
+            health_port: 0,
+            statement_timeout_ms: 30_000,
+            idle_in_transaction_timeout_ms: 60_000,
+            token_metadata_refresh_interval: Duration::from_secs(86_400),
+            network_passphrase: "Test SDF Network ; September 2015".to_string(),
+            tracked_sac_assets: Vec::new(),
+        };
+
+        let result = Streamer::new(config, db).await;
+        assert!(
+            result.is_err(),
+            "Streamer::new must fail when the startup RPC check is enabled \
+             and no configured endpoint is reachable"
+        );
     }
 }
